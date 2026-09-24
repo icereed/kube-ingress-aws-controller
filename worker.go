@@ -73,7 +73,11 @@ func (l *loadBalancer) Status() int {
 	if l.clusterLocal {
 		return ready
 	}
-	if l.stack.ShouldDelete() {
+	// A stack is only deleted once no ingress is assigned to it anymore.
+	// Its certificate TTL tags may have expired while ingresses were still
+	// (or again) assigned; in that case the stack is updated, which
+	// refreshes the tags, instead of being deleted with live traffic on it.
+	if l.stack.ShouldDelete() && !l.hasIngresses() {
 		return delete
 	}
 	if len(l.ingresses) != 0 && l.stack == nil {
@@ -83,6 +87,18 @@ func (l *loadBalancer) Status() int {
 		return update
 	}
 	return ready
+}
+
+// hasIngresses returns true if at least one ingress is assigned to the load
+// balancer. Certificates carried over from the stack are initialized with an
+// empty ingress list, so the map itself can't be used for this check.
+func (l *loadBalancer) hasIngresses() bool {
+	for _, ingresses := range l.ingresses {
+		if len(ingresses) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // inSync checks if the loadBalancer is in sync with the backing CF stack. It's
@@ -440,7 +456,10 @@ func matchIngressesToLoadBalancers(
 	}
 	loadBalancers = append(loadBalancers, clusterLocalLB)
 
-	for _, ingress := range ingresses {
+	// Ingresses already served by a load balancer are matched first, so they
+	// stay on it and new ingresses join load balancers that are in use
+	// instead of stacks that are about to be deleted.
+	for _, ingress := range stickyIngressesFirst(ingresses) {
 		if ingress.ClusterLocal {
 			clusterLocalLB.addIngress(nil, ingress, math.MaxInt64)
 			continue
@@ -465,7 +484,7 @@ func matchIngressesToLoadBalancers(
 		// try to add ingress to existing ALB stacks until certificate
 		// limit is exeeded.
 		added := false
-		for _, lb := range loadBalancers {
+		for _, lb := range candidateLoadBalancers(loadBalancers, ingress) {
 			// TODO(mlarsen): hack to phase out old load balancers
 			// which can't be updated to include type
 			// specification.
@@ -511,6 +530,37 @@ func matchIngressesToLoadBalancers(
 	}
 
 	return loadBalancers
+}
+
+// stickyIngressesFirst returns the ingresses with those that already have a
+// load balancer hostname in their status first, keeping the relative order.
+func stickyIngressesFirst(ingresses []*kubernetes.Ingress) []*kubernetes.Ingress {
+	sorted := make([]*kubernetes.Ingress, len(ingresses))
+	copy(sorted, ingresses)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return sorted[i].Hostname != "" && sorted[j].Hostname == ""
+	})
+	return sorted
+}
+
+// candidateLoadBalancers returns the order in which load balancers are tried
+// for an ingress: the one currently serving it, then the ones that already
+// have ingresses assigned, then all others.
+func candidateLoadBalancers(loadBalancers []*loadBalancer, ingress *kubernetes.Ingress) []*loadBalancer {
+	current := make([]*loadBalancer, 0, 1)
+	inUse := make([]*loadBalancer, 0, len(loadBalancers))
+	rest := make([]*loadBalancer, 0, len(loadBalancers))
+	for _, lb := range loadBalancers {
+		switch {
+		case ingress.Hostname != "" && lb.stack != nil && strings.EqualFold(lb.stack.DNSName, ingress.Hostname):
+			current = append(current, lb)
+		case lb.hasIngresses():
+			inUse = append(inUse, lb)
+		default:
+			rest = append(rest, lb)
+		}
+	}
+	return append(append(current, inUse...), rest...)
 }
 
 // addCloudWatchAlarms attaches CloudWatch Alarms to each load balancer model
